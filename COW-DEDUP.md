@@ -1,5 +1,7 @@
 ## COW Memory Deduplication
 
+> demo repo: https://github.com/THLiu55/criu
+
 ### 1. Goal
 
 Reduce CRIU checkpoint image size by detecting at **dump time** which pages in a
@@ -112,4 +114,6 @@ dump time is guaranteed to have `vma->pvma != NULL` at restore time.
 
 ### 5. Future Works
 
-What I’m doing now is essentially moving CRIU’s existing parent-child COW shared-page reuse mechanism from the restore phase to the dump phase, so that during checkpointing we can avoid writing many pages that do not actually need to be stored. To ensure correctness first, I have not focused too much on optimizing the dump-time COW detection versus the restore-time duplicate-page detection logic. Further work can then focus on improving performance.
+What I’m doing now is essentially moving CRIU’s existing parent-child COW shared-page reuse mechanism from the restore phase to the dump phase, so that during checkpointing we can avoid writing many pages that do not actually need to be stored. 
+
+At this stage, my main priority is correctness: I want to ensure that any page skipped during dump is exactly a page that can be safely reused from the parent during restore. Because of that, I have not yet focused on removing redundant checks between the dump and restore phases. Performance optimization can be explored in future work.
