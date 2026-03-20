@@ -1783,6 +1783,24 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	exit_code = 0;
+
+	/*
+	 * Save the VMA list for child COW dedup before freeing it.
+	 * Children are dumped after the parent returns, so we must
+	 * keep the VMA entries alive on the heap.
+	 */
+	if (opts.cow_dedup && has_children(item)) {
+		struct vm_area_list *saved = xmalloc(sizeof(*saved));
+
+		if (saved) {
+			*saved = vmas; /* copy metadata */
+			list_replace_init(&vmas.h, &saved->h); /* transfer entries */
+			dmpi(item)->vma_area_list = saved;
+			pr_info("COW dedup: saved %u VMAs for pid %d\n",
+				saved->nr, item->pid->real);
+		}
+	}
+
 err:
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
@@ -2245,6 +2263,17 @@ int cr_dump_tasks(pid_t pid)
 	for_each_pstree_item(item) {
 		if (dump_one_task(item, parent_ie))
 			goto err;
+	}
+
+	/* Free saved VMA lists used for COW dedup */
+	if (opts.cow_dedup) {
+		for_each_pstree_item(item) {
+			if (dmpi(item)->vma_area_list) {
+				free_mappings(dmpi(item)->vma_area_list);
+				xfree(dmpi(item)->vma_area_list);
+				dmpi(item)->vma_area_list = NULL;
+			}
+		}
 	}
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);

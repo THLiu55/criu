@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/uio.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -83,6 +84,191 @@ unsigned long dump_pages_args_size(struct vm_area_list *vmas)
 	/* In the worst case I need one iovec for each page */
 	return sizeof(struct parasite_dump_pages_args) + vmas->nr * sizeof(struct parasite_vma_entry) +
 	       (vmas->nr_priv_pages + 1) * sizeof(struct iovec);
+}
+
+/*
+ * COW Page Deduplication Support
+ *
+ * Phase 1 (PFN check): read /proc/PID/pagemap for both processes; identical
+ * PFNs mean the kernel still shares the same physical page (true COW).
+ *
+ * Phase 2 (content check): if PFNs differ, use process_vm_readv() + memcmp().
+ * Both processes are frozen at this point, so identical content means the child
+ * can safely inherit the parent's restored page.
+ */
+
+/*
+ * Read Page Frame Number (PFN) from /proc/PID/pagemap for a given virtual address.
+ * Returns PFN on success, 0 if page not present, -1ULL on error.
+ */
+
+static uint64_t read_pfn_from_pagemap(pid_t pid, unsigned long vaddr)
+{
+	char pagemap_path[64];
+	uint64_t pagemap_entry;
+	uint64_t pfn;
+	off_t offset;
+	int fd;
+	ssize_t ret;
+
+	snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
+
+	fd = open(pagemap_path, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Cannot open %s", pagemap_path);
+		return -1ULL;
+	}
+
+	/* Each page has an 8-byte entry in pagemap */
+	offset = (vaddr / PAGE_SIZE) * sizeof(uint64_t);
+
+	ret = pread(fd, &pagemap_entry, sizeof(pagemap_entry), offset);
+	close(fd);
+
+	if (ret != sizeof(pagemap_entry)) {
+		if (ret < 0)
+			pr_perror("pread failed for %s offset %lx", pagemap_path, offset);
+		else
+			pr_err("Short read from %s: %zd bytes\n", pagemap_path, ret);
+		return -1ULL;
+	}
+
+	/* Check if page is present (bit 63) */
+	if (!(pagemap_entry & (1ULL << 63))) {
+		pr_debug("Page not present: pid=%d vaddr=%lx\n", pid, vaddr);
+		return 0;
+	}
+
+	/* Extract PFN from bits 0-54 */
+	pfn = pagemap_entry & ((1ULL << 55) - 1);
+
+	return pfn;
+}
+
+/*
+ * Check if a page is truly kernel-COW-shared between parent and child
+ * by comparing Page Frame Numbers (PFN) from /proc/PID/pagemap.
+
+ */
+static bool is_cow_page_by_pfn(pid_t ppid, pid_t cpid, unsigned long vaddr)
+{
+	uint64_t parent_pfn, child_pfn;
+
+	parent_pfn = read_pfn_from_pagemap(ppid, vaddr);
+	if (parent_pfn == 0 || parent_pfn == -1ULL)
+		return false;
+
+	child_pfn = read_pfn_from_pagemap(cpid, vaddr);
+	if (child_pfn == 0 || child_pfn == -1ULL)
+		return false;
+
+	/* True COW: same physical page */
+	if (parent_pfn == child_pfn) {
+		pr_debug("COW detected: pid %d/%d vaddr %lx pfn %llx\n",
+			 ppid, cpid, vaddr, (unsigned long long)parent_pfn);
+		return true;
+	}
+
+	pr_debug("Not COW: pid %d pfn %llx != pid %d pfn %llx (vaddr %lx)\n",
+		 ppid, (unsigned long long)parent_pfn,
+		 cpid, (unsigned long long)child_pfn, vaddr);
+	return false;
+}
+
+/*
+ * Check whether a page can be safely skipped by comparing its content
+ * between parent and child via process_vm_readv().
+ */
+static bool is_cow_page_by_content(pid_t ppid, pid_t cpid, unsigned long vaddr)
+{
+	char pbuf[PAGE_SIZE], cbuf[PAGE_SIZE];
+	struct iovec piov = { pbuf, PAGE_SIZE };
+	struct iovec ciov = { cbuf, PAGE_SIZE };
+	struct iovec addr = { (void *)vaddr, PAGE_SIZE };
+
+	if (process_vm_readv(ppid, &piov, 1, &addr, 1, 0) != PAGE_SIZE)
+		return false;
+
+	if (process_vm_readv(cpid, &ciov, 1, &addr, 1, 0) != PAGE_SIZE)
+		return false;
+
+	return memcmp(pbuf, cbuf, PAGE_SIZE) == 0;
+}
+
+static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma);
+
+/*
+ * Build a dump-time COW parent-VMA map in a single O(N+M) merge-sort pass
+ * (identical scan to prepare_cow_vmas_for()) so that dump-time matches agree
+ * with restore-time inheritance decisions.
+ *
+ * Returns a heap-allocated array of size child_vmas->nr, indexed by VMA list
+ * position.  Each slot holds the matched parent vma_area, or NULL if the VMA
+ * has no parent (either no match or the <= advance would skip it).
+ * Returns NULL if COW dedup is not applicable for this item.
+ *
+ * Caller must xfree() the result.
+ */
+static struct vma_area **build_dump_cow_pvma_map(struct pstree_item *item,
+						 struct vm_area_list *child_vmas)
+{
+	struct pstree_item *parent = item->parent;
+	struct vm_area_list *pvmas;
+	struct vma_area **map;
+	struct vma_area *vma, *pvma;
+	unsigned int i;
+
+	if (!parent || !task_alive(parent))
+		return NULL;
+
+	/*
+	 * prepare_pstree_ids() reparents direct children of root_item that
+	 * are in a different session (and are not session leaders) to helper
+	 * tasks that have no VMAs.  Such tasks won't get vma->pvma set at
+	 * restore time, so any PE_PARENT_PROC pages we write here cannot be
+	 * consumed there.  Skip COW dedup for these tasks.
+	 */
+	if (parent == root_item &&
+	    item->sid != root_item->sid &&
+	    item->sid != vpid(item))
+		return NULL;
+
+	pvmas = dmpi(parent)->vma_area_list;
+	if (!pvmas)
+		return NULL;
+
+	map = xzalloc(child_vmas->nr * sizeof(*map));
+	if (!map)
+		return NULL;
+
+	vma = list_first_entry(&child_vmas->h, struct vma_area, list);
+	pvma = list_first_entry(&pvmas->h, struct vma_area, list);
+	i = 0;
+
+	while (1) {
+		if (&pvma->list == &pvmas->h || vma_area_is(pvma, VMA_AREA_GUARD))
+			break;
+
+		if (vma->e->start == pvma->e->start && check_cow_vmas(vma, pvma))
+			map[i] = pvma;
+
+		/* <= advance: mirrors prepare_cow_vmas_for() exactly */
+		while (vma->e->start <= pvma->e->start) {
+			vma = vma_next(vma);
+			i++;
+			if (i >= child_vmas->nr || vma_area_is(vma, VMA_AREA_GUARD))
+				goto done;
+		}
+
+		while (pvma->e->start < vma->e->start) {
+			pvma = vma_next(pvma);
+			if (&pvma->list == &pvmas->h ||
+			    vma_area_is(pvma, VMA_AREA_GUARD))
+				goto done;
+		}
+	}
+done:
+	return map;
 }
 
 static inline bool __page_is_zero(u64 pme)
@@ -218,14 +404,20 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * the memory contents is present in the parent image set.
  */
 
-static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent)
+static int generate_iovs(struct pstree_item *item, struct vma_area *vma,
+			 struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
+			 bool has_parent, bool skip_cow_dedup,
+			 struct vma_area *cow_pvma)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
 	int ret = 0;
+
+	/* AIORING VMAs are not safe for COW dedup regardless of pre-computed map */
+	if (skip_cow_dedup)
+		cow_pvma = NULL;
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
@@ -257,6 +449,34 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		if (has_parent && page_in_parent(page_info.softdirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
+		} else if (opts.cow_dedup && cow_pvma) {
+			pid_t ppid = item->parent->pid->real;
+			pid_t cpid = item->pid->real;
+			bool can_dedup;
+
+			/* Phase 1: PFN check — fast (8-byte pread each). */
+			if (is_cow_page_by_pfn(ppid, cpid, vaddr)) {
+				can_dedup = true;
+				pr_debug("COW dedup: pfn match vaddr=%lx\n", vaddr);
+			} else {
+				/* Phase 2: content check — more expensive */
+				can_dedup = is_cow_page_by_content(ppid, cpid, vaddr);
+				if (can_dedup)
+					pr_debug("COW dedup: content match vaddr=%lx\n", vaddr);
+			}
+
+			if (can_dedup) {
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_COW_PARENT);
+				st = 0;
+				cnt_add(CNT_PAGES_DUMP_COW, 1);
+			} else {
+				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+					st = 1;
+				else
+					st = 2;
+			}
+			cnt_add(CNT_PAGES_DUMP_COW_SCANNED, 1);
 		} else {
 			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
 			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
@@ -411,12 +631,15 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 	return 0;
 }
 
-static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
-			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
-			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
+static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma,
+			     struct page_pipe *pp, struct page_xfer *xfer,
+			     struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode,
+			     struct vma_area *cow_pvma)
 {
 	u64 vaddr;
 	int ret;
+	bool skip_cow_dedup = false;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
@@ -499,6 +722,13 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
+	/*
+	 * Don't attempt COW dedup for aioring VMAs: the kernel writes to
+	 * these pages asynchronously even when the process is stopped, so
+	 * content comparison is unreliable.
+	 */
+	skip_cow_dedup = vma_entry_is(vma->e, VMA_AREA_AIORING);
+
 	if (pmc_get_map(pmc, vma))
 		return -1;
 
@@ -506,7 +736,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, skip_cow_dedup, cow_pvma);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -529,10 +759,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	pmc_t pmc = PMC_INIT;
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
+	struct vma_area **cow_pvma_map = NULL;
 	struct page_xfer xfer = { .parent = NULL };
 	int ret, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
+	unsigned int vma_idx;
 	int possible_pid_reuse = 0;
 	bool has_parent;
 	int parent_predump_mode = -1;
@@ -598,12 +830,24 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
+	/*
+	 * Build the dump-time COW parent-VMA map in a single O(N+M) pass
+	 * (same merge-sort scan as prepare_cow_vmas_for()) so the per-VMA
+	 * loop below is O(1) per VMA instead of O(N+M) per VMA.
+	 */
+	if (opts.cow_dedup)
+		cow_pvma_map = build_dump_cow_pvma_map(item, vma_area_list);
+
+	vma_idx = 0;
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
+		struct vma_area *cow_pvma = cow_pvma_map ? cow_pvma_map[vma_idx] : NULL;
+
+		vma_idx++;
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
 
-		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode);
+		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent,
+					mdc->pre_dump, parent_predump_mode, cow_pvma);
 		if (ret < 0)
 			goto out_xfer;
 	}
@@ -646,6 +890,7 @@ out_pp:
 	else
 		dmpi(item)->mem_pp = pp;
 out:
+	xfree(cow_pvma_map);
 	pmc_fini(&pmc);
 	pr_info("----------------------------------------\n");
 	return exit_code;
@@ -1219,6 +1464,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			if (vma_inherited(vma)) {
 				clear_bit(off, vma->pvma->page_bitmap);
 
+				if (pagemap_in_parent_proc(pr->pe)) {
+					pr->skip_pages(pr, PAGE_SIZE);
+					va += PAGE_SIZE;
+					nr_shared++;
+					continue;
+				}
 				ret = pr->read_pages(pr, va, 1, buf, 0);
 				if (ret < 0)
 					goto err_read;
@@ -1235,6 +1486,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				memcpy(p, buf, PAGE_SIZE);
 			} else {
 				int nr;
+
+				if (unlikely(pagemap_in_parent_proc(pr->pe))) {
+					pr_err("PE_PARENT_PROC page at %lx in non-inherited VMA "
+					       "(dump/restore invariant violation)\n", va);
+					return -1;
+				}
 
 				/*
 				 * Try to read as many pages as possible at once.

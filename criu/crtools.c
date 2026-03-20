@@ -550,6 +550,8 @@ usage:
 	       "                        pages images of previous dump\n"
 	       "                        when used on restore, as soon as page is restored, it\n"
 	       "                        will be punched from the image\n"
+	       "  --cow-dedup           deduplicate COW pages between live parent and child\n"
+	       "                        processes during dump (requires live parent process)\n"
 	       "  --pre-dump-mode       splice - parasite based pre-dumping (default)\n"
 	       "                        read   - process_vm_readv syscall based pre-dumping\n"
 	       "\n"

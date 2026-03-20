@@ -458,6 +458,8 @@ static int get_hole_flags(struct page_pipe *pp, int n)
 
 	if (hole_flags == PP_HOLE_PARENT)
 		return PE_PARENT;
+	else if (hole_flags == PP_HOLE_COW_PARENT)
+		return PE_PARENT_PROC;
 	else
 		BUG();
 
@@ -476,6 +478,8 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp, unsigned int
 			break;
 
 		hole_flags = get_hole_flags(pp, *cur_hole);
+		pr_debug("\tdump_hole[%d]: %p len=%lu flags=0x%x\n",
+			 *cur_hole, hole.iov_base, hole.iov_len, hole_flags);
 		ret = page_xfer_dump_hole(xfer, &hole, hole_flags);
 		if (ret)
 			return ret;
@@ -906,8 +910,10 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len)) {
+				pr_err("write_pages failed for iov=%p len=%lu\n", iov.iov_base, iov.iov_len);
 				return -1;
+			}
 		}
 	}
 

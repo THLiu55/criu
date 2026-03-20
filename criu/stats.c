@@ -136,6 +136,12 @@ static void display_stats(int what, StatsEntry *stats)
 		       stats->dump->pages_written);
 		pr_msg("Lazy memory pages: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_lazy,
 		       stats->dump->pages_lazy);
+		if (stats->dump->has_pages_cow_scanned)
+			pr_msg("COW pages scanned: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_cow_scanned,
+			       stats->dump->pages_cow_scanned);
+		if (stats->dump->has_pages_cow_dedup)
+			pr_msg("COW pages deduplicated: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_cow_dedup,
+			       stats->dump->pages_cow_dedup);
 	} else if (what == RESTORE_STATS) {
 		pr_msg("Displaying restore stats:\n");
 		pr_msg("Pages compared: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_compared,
@@ -185,6 +191,11 @@ void write_stats(int what)
 		ds_entry.has_shpages_skipped_parent = true;
 		ds_entry.shpages_written = dstats->counts[CNT_SHPAGES_WRITTEN];
 		ds_entry.has_shpages_written = true;
+
+		ds_entry.pages_cow_scanned = dstats->counts[CNT_PAGES_DUMP_COW_SCANNED];
+		ds_entry.has_pages_cow_scanned = true;
+		ds_entry.pages_cow_dedup = dstats->counts[CNT_PAGES_DUMP_COW];
+		ds_entry.has_pages_cow_dedup = true;
 
 		name = "dump";
 	} else if (what == RESTORE_STATS) {

@@ -57,6 +57,7 @@ struct thread_lsm {
 };
 
 struct ns_id;
+struct vm_area_list;
 struct dmp_info {
 	struct ns_id *netns;
 	struct page_pipe *mem_pp;
@@ -71,6 +72,14 @@ struct dmp_info {
 	 * entry means there was no LSM profile for this thread.
 	 */
 	struct thread_lsm **thread_lsms;
+
+	/*
+	 * Pointer to the collected VMA list for this item.
+	 * Set after VMA collection during dump so child processes
+	 * can look up parent VMAs via dmpi(item->parent)->vma_area_list.
+	 */
+	struct vm_area_list *vma_area_list;
+
 };
 
 static inline struct dmp_info *dmpi(const struct pstree_item *i)

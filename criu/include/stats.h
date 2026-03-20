@@ -33,6 +33,10 @@ enum {
 	CNT_SHPAGES_SKIPPED_PARENT,
 	CNT_SHPAGES_WRITTEN,
 
+	/* COW dedup dump-time counters */
+	CNT_PAGES_DUMP_COW_SCANNED,	/* pages examined for COW identity */
+	CNT_PAGES_DUMP_COW,		/* pages confirmed COW, not written */
+
 	DUMP_CNT_NR_STATS,
 };
 

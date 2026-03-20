@@ -110,7 +110,8 @@ struct page_pipe_buf {
  */
 #define PP_PIPE_TYPES 2
 
-#define PP_HOLE_PARENT (1 << 0)
+#define PP_HOLE_PARENT	   (1 << 0)
+#define PP_HOLE_COW_PARENT (1 << 1) /* Page verified as COW with live parent */
 
 struct page_pipe {
 	unsigned int nr_pipes;			   /* how many page_pipe_bufs in there */
